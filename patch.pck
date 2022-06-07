@@ -1,5 +1,5 @@
 VER2
-REM Список элементов
+REM РЎРїРёСЃРѕРє СЌР»РµРјРµРЅС‚РѕРІ
 REM ibs@XXX
 REM CFT-Platform-IDE: 2.36.176
 

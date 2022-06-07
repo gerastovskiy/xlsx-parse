@@ -1,0 +1,601 @@
+class MAIN_DOCUM;
+
+@name('XXX. Пример операции парсинга файла xlsx')
+static method XXX_XLSX_PARSE is
+pragma include(::[RUNTIME].[MACRO_LIB]);
+
+-- хранение прочитанного заголовка (1 строка)
+type t_Header is table of varchar(1024) index by pls_integer;
+
+-- результат парсинга строки
+/*
+Значения CODE:
+	- null - корректно
+	- 1 - ошибка (обработка файла прерывается)
+	- 2 - пропуск строки (файл обрабатывается, строка пропускается)
+	- 3 - предупреждение (файл и строка обрабатывается, созданный документ не проводится)
+При внесении изменений исправить fillErrorCell
+*/
+type t_status is record (
+	CODE	INTEGER,
+	TEXT	VARCHAR2(32000)
+);
+
+-- строки с данными (структуру заполнять очень внимательно, особенно длины строк)
+type t_ExcelSingleRecord is record (
+	STR		VARCHAR2(32000),
+	NUM_1	NUMBER,
+	NUM_2	NUMBER,
+	DATE_1	DATE,
+	DATE_2	DATE,
+	BOOL	BOOLEAN,
+	STATUS	t_status
+);
+
+type t_ExcelRecords is table of t_ExcelSingleRecord index by pls_integer;
+
+-- кэширование документов на счёте невыясненных сумм
+type t_main_docum is table of ref [MAIN_DOCUM] index by varchar2(512);
+v_undef_doc	t_main_docum;
+
+
+-- заполнение информации об ошибочной ячейке
+function fillErrorCell(p_Row in integer, p_Col in integer, p_Sheet in integer, p_ErrCode in integer) return varchar2(100)
+is
+	ret_ErrorCell	varchar2(100);
+begin
+	ret_ErrorCell := '[Строка ' || p_Row || ', столбец ' || p_Col || ', страница ' || p_Sheet || ']. ';
+	
+	if p_ErrCode is null then
+		ret_ErrorCell := ret_ErrorCell || '[Запись корректна]';
+	elsif p_ErrCode = 1 then
+		ret_ErrorCell := ret_ErrorCell || '[Ошибка]';
+	elsif p_ErrCode = 2 then
+		ret_ErrorCell := ret_ErrorCell || '[Пропуск строки]';
+	elsif p_ErrCode = 3 then
+		ret_ErrorCell := ret_ErrorCell || '[Предупреждение]';
+	else
+		ret_ErrorCell := ret_ErrorCell || '[Неописанная ошибка]';		
+	end if;
+	
+	return ret_ErrorCell;
+end;
+
+
+-- 4 основных метода получения значений
+-- получение строки (базовый метод)
+function getStr(p_Row in integer, p_Col in integer, p_Sheet in integer, p_Res in out t_status) return varchar2(32000)
+is
+	vErrCode	integer;
+	vSt			integer;		-- индекс стиля ячейки	(tp_cell в ::[OOXML].[XL])
+	vTp			varchar2(50); 	-- номер листа			(tp_cell в ::[OOXML].[XL])
+	ret_ValStr	varchar2(32000);	
+begin
+	ret_ValStr := ::[OOXML].[XL].getSheetRowColVal(
+													  p_row		==	p_Row
+													, p_col		==	p_Col
+													, p_sheet	==	p_Sheet
+													, p_tp		==	vTp
+													, p_st		==	vSt
+													);
+	return trim(ret_ValStr);	
+exception
+	when value_error then
+		vErrCode := 1;
+		p_Res.[CODE] := p_Res.[CODE] || vErrCode;
+		p_Res.[TEXT] := p_Res.[TEXT] || fillErrorCell(p_Row, p_Col, p_Sheet, vErrCode) || '. Ячейка содержит больше 32000 символов' || chr(10);
+		return null;
+end;
+
+
+-- получение числа
+function getNum(p_Row in integer, p_Col in integer, p_Sheet in integer, p_Res in out t_status) return number
+is
+	vErrCode	integer;
+	ret_ValNum	number;
+begin
+	ret_ValNum := to_number(translate(getStr(p_Row, p_Col, p_Sheet, p_Res), ',', '.'));
+	return ret_ValNum;
+exception
+	when value_error then
+		vErrCode := 1;
+		p_Res.[CODE] := p_Res.[CODE] || vErrCode;
+		p_Res.[TEXT] := p_Res.[TEXT] || fillErrorCell(p_Row, p_Col, p_Sheet, vErrCode) || '. Ошибка в типе данных, ожидается число' || chr(10);
+		return null;
+end;
+
+
+-- получение даты, формат DD.MM.YYYY или DD/MM/YYYY
+function getDate(p_Row in integer, p_Col in integer, p_Sheet in integer, p_Res in out t_status) return date
+is
+	vErrCode	integer;
+	ret_ValDate	date;
+begin
+	ret_ValDate := to_date(translate(getStr(p_Row, p_Col, p_Sheet, p_Res), '-/', '..'), 'DD.MM.YYYY');
+	return ret_ValDate;
+exception
+	when value_error then
+		vErrCode := 1;
+		p_Res.[CODE] := p_Res.[CODE] || vErrCode;
+		p_Res.[TEXT] := p_Res.[TEXT] || fillErrorCell(p_Row, p_Col, p_Sheet, vErrCode) || '. Ошибка в типе данных, ожидается дата' || chr(10);
+		return null;
+end;
+
+
+-- получение логического значения
+function getBool(p_Row in integer, p_Col in integer, p_Sheet in integer, p_Res in out t_status) return boolean
+is
+	vErrCode	integer;
+	vStr		varchar2(32000);
+	ret_ValBool	boolean;
+begin
+	vStr := getStr(p_Row, p_Col, p_Sheet, p_Res);
+	if nvl(vStr, 'N') = 'N' then
+		ret_ValBool := false;
+	elsif vStr = 'Y' then
+		ret_ValBool := true;
+	else
+		vErrCode := 1;
+		p_Res.[CODE] := p_Res.[CODE] || vErrCode;
+		p_Res.[TEXT] := p_Res.[TEXT] || fillErrorCell(p_Row, p_Col, p_Sheet, vErrCode) || '. Ошибка в типе данных, ожидается логика' || chr(10);
+	end if;	
+	return ret_ValBool;
+end;
+
+
+-- дополнительные методы получения значений
+-- получение платёжного документа на счёте невыясненных сумм (с кэшированием)
+function getUndefMainDocum(p_Row in integer, p_Col in integer, p_Sheet in integer, p_Summa in [SUMMA], p_IncomeClientReq in [REQ_CLIENT], p_Res in out t_status) return ref [MAIN_DOCUM]
+is
+	vErrCode	integer;
+	vSeachMask	varchar2(512);
+begin
+	-- кэш документов на счёте невыясненных сумм
+	-- фильтр аналогичный представлению "Контроль документов на счёте невыясненных сумм"
+	if v_undef_doc.first is null then
+		debug_pipe('[getUndefMainDocum]. Кэширование документов на счёте невыясненных сумм, строки для поиска:', 9);
+		for
+			(
+				select mdoc(mdoc%id : id, mdoc.[DOCUMENT_NUM]||':'||to_char(mdoc.[SUM], 'FM999999990.00')||':'||mdoc.[KL_DT].[2].[1] : searchmask, mdoc.[ACC_DT] : acc_dt)
+				in ::[MAIN_DOCUM]
+				-- вариант из представления "Контроль документов на счёте невыясненных сумм"
+							,(
+							select distinct acc_kt(acc_kt.[ACC_STRANGE]%id : id)
+							in ::[TRC]
+							where acc_kt.[DATE_CLOSE] is null
+								and acc_kt.[TYPE_DOG] = ::[CONTRACT_TYPE]([IDENT] = 'Z' and [GROUP_CODE] = 'РАСЧЕТ_ЦЕНТР')
+								and acc_kt.[ACC_STRANGE] is not null
+								--and acc_kt.[FILIAL] = ::[SYSTEM].[VARIABLES].OurBranch
+							)
+							,(
+							select distinct acc_dt(acc_dt.[ACC_STRANGE_ACT]%id : id)
+							in ::[TRC]
+							where acc_dt.[DATE_CLOSE] is null
+								and acc_dt.[TYPE_DOG] = ::[CONTRACT_TYPE]([IDENT] = 'Z' and [GROUP_CODE] = 'РАСЧЕТ_ЦЕНТР')
+								and acc_dt.[ACC_STRANGE_ACT] is not null
+								--and acc_dt.[FILIAL] = ::[SYSTEM].[VARIABLES].OurBranch
+							)
+				where
+					mdoc.[QUIT_DOC] is null and
+					substr(mdoc.[NUM_KT],1,5) not in ('70603','70608') and substr(mdoc.[NUM_DT],1,5) not in ('70603','70608') and
+					mdoc%state = 'PROV' and
+					(mdoc.[MAIN_SMART] is null or SYS_CONTEXT('IBS_USER', 'SHOW_BORN_DOC') = '1') and
+					(mdoc.[ACC_KT] = acc_kt.id or mdoc.[ACC_DT] = acc_dt.id)
+					--and (mdoc%id = 80651844458 or mdoc%id = 80635841680 or mdoc%id = 80635801400 or mdoc%id =80635784502) -- для быстрого тестирования
+					-- TODO: если возникнут нюансы с выборкой (строит неэффективный план запроса)
+					-- 1. вариант из представления "Контроль документов на счёте невыясненных сумм"
+					/*
+					and (
+						-- список счетов невыясненных сумм 47416
+						mdoc.[ACC_KT]%id in
+							(
+							select distinct dog(dog.[ACC_STRANGE]%id)
+							in ::[TRC]
+							where dog.[DATE_CLOSE] is null
+								and dog.[TYPE_DOG] = ::[CONTRACT_TYPE]([IDENT] = 'Z' and [GROUP_CODE] = 'РАСЧЕТ_ЦЕНТР')
+								and dog.[ACC_STRANGE] is not null
+								--and dog.[FILIAL] = ::[SYSTEM].[VARIABLES].OurBranch
+							)
+						or
+						-- список счетов невыясненных сумм 47417
+						mdoc.[ACC_DT]%id in
+							(
+							select distinct dog(dog.[ACC_STRANGE_ACT]%id)
+							in ::[TRC]
+							where dog.[DATE_CLOSE] is null
+								and dog.[TYPE_DOG] = ::[CONTRACT_TYPE]([IDENT] = 'Z' and [GROUP_CODE] = 'РАСЧЕТ_ЦЕНТР')
+								and dog.[ACC_STRANGE_ACT] is not null
+								--and dog.[FILIAL] = ::[SYSTEM].[VARIABLES].OurBranch
+							)
+
+					)
+					*/
+					-- TODO: если возникнут нюансы с выборкой (строит неэффективный план запроса)
+					-- 2. вариант из представления "Документы на счёте невыясненных сумм"
+					/*
+					and (
+						(
+							mdoc.[VID_DOC] not in (::[NAME_PAYDOC]([CODE] = 'ДЕБ_АВИЗО'),::[NAME_PAYDOC]([CODE] = 'БЕЗН_ПЛ_ТРЕБ')) and
+							substr(mdoc.[NUM_KT],1,5) in ('47416','47417')
+						)
+						or
+						(
+							mdoc.[VID_DOC] in (::[NAME_PAYDOC]([CODE] = 'ДЕБ_АВИЗО'),::[NAME_PAYDOC]([CODE] = 'БЕЗН_ПЛ_ТРЕБ')) and
+							substr(mdoc.[NUM_DT],1,5) in ('47416','47417')
+						)
+					)
+					and not exists (select md(md%id: id) in ::[MAIN_DOCUM] all where md.[QUIT_DOC] = mdoc%id)
+					*/
+			)
+		loop
+			v_undef_doc(mdoc.searchmask) := mdoc.id;
+			debug_pipe('[getUndefMainDocum id: ' || mdoc.id || ']. ' || mdoc.searchmask, 10);
+		end loop;
+	end if;
+
+	-- формат маски для быстрого поиска номер документа : сумма : счёт плательщика
+	vSeachMask := getStr(p_Row, p_Col, p_Sheet, p_Res) || ':' || to_char(p_Summa, 'FM999999990.00') || ':' || p_IncomeClientReq.[2].[1];
+	debug_pipe('[getUndefMainDocum]. Маска для поиска документа среди документов находящихся на счёте невыясненных сумм: ' || vSeachMask, 10);
+		
+	if v_undef_doc.exists(vSeachMask) then
+		debug_pipe('[getUndefMainDocum]. Найден документ на счёте невыясненных сумм с id = ' || v_undef_doc(vSeachMask), 9);
+		return v_undef_doc(vSeachMask);
+	else
+		vErrCode := 1;
+		p_Res.[CODE] := p_Res.[CODE] || vErrCode;
+		p_Res.[TEXT] := p_Res.[TEXT] || fillErrorCell(p_Row, p_Col, p_Sheet, vErrCode) || '. Не найден документ на счёте невыясненных сумм (номер:сумма:счёт платёльщика): ' || vSeachMask || chr(10);
+		return null;
+	end if;
+	
+exception
+	when value_error then
+		vErrCode := 1;
+		p_Res.[CODE] := p_Res.[CODE] || vErrCode;
+		p_Res.[TEXT] := p_Res.[TEXT] || fillErrorCell(p_Row, p_Col, p_Sheet, vErrCode) || '. Ошибка в данных, ожидается номер платёжного документа, находящегося на счёте невыясненных сумм в ячейке';
+		return null;
+end;
+
+
+-- инициализация стандарта заголовка
+function initStandatdHeader return t_Header is
+	ret_HeaderStandard t_Header;
+begin
+	ret_HeaderStandard(1) := 'строка';
+	ret_HeaderStandard(2) := 'число с точкой';
+	ret_HeaderStandard(3) := 'число с запятой';
+	ret_HeaderStandard(4) := 'дата с точкой';
+	ret_HeaderStandard(5) := 'дата со слэшем';
+	ret_HeaderStandard(6) := 'логическое значение';
+
+	return ret_HeaderStandard;
+end;
+
+
+-- чтение заголовка
+-- p_Sheet - номер закладки; p_Row - столбец; p_Col - строка
+function readHeader(p_Sheet integer, p_Row integer) return t_Header is
+	vTempRes	t_status;
+	ret_Header 	t_Header;
+begin
+	ret_Header(1) := getStr(p_Row, 1, p_Sheet, vTempRes);
+	ret_Header(2) := getStr(p_Row, 2, p_Sheet, vTempRes);
+	ret_Header(3) := getStr(p_Row, 3, p_Sheet, vTempRes);
+	ret_Header(4) := getStr(p_Row, 4, p_Sheet, vTempRes);
+	ret_Header(5) := getStr(p_Row, 5, p_Sheet, vTempRes);
+	ret_Header(6) := getStr(p_Row, 6, p_Sheet, vTempRes);
+	
+	return ret_Header;
+end;
+
+
+-- проверка идентичности прочитанного заголовка требуемому
+function checkHeader(p_HeaderStandard t_Header, p_Header t_Header) return boolean is
+begin
+	for i in 1..p_HeaderStandard.count loop
+		if UPPER(p_Header(i)) <> UPPER(p_HeaderStandard(i)) or p_Header(i) is null then
+			debug_pipe('Неверный заголовок в ' || to_char(i) || ' столбце. В рееста указан "' || p_Header(i) || '", должен быть "' || p_HeaderStandard(i) || '"', 0);
+			return false;
+		end if;
+	end loop;
+	
+	return true;
+end;
+
+
+-- проверка соответствия формату заголовка
+function checkHeaderFormat return boolean is
+	vHeader			t_Header;
+	vHeaderStandard	t_Header;
+	vSheet			integer := 1;
+	vRow			integer := 1;
+begin
+	vHeaderStandard := initStandatdHeader;
+	
+	vHeader := readHeader(vSheet, vRow);
+	
+	if checkHeader(vHeaderStandard, vHeader) then
+		return true;
+	end if;
+
+	return false;
+exception when others then
+	debug_pipe('[checkHeaderFormat]: ' || sqlerrm, 9);
+	return false;
+end;
+
+
+-- обработка одной строки Excel
+function readAndCheckSingleStr(p_row integer, p_sheet integer) return t_ExcelSingleRecord is
+	ret_ExcelSingleRecord	t_ExcelSingleRecord;
+begin
+	ret_ExcelSingleRecord.[STR] := getStr(p_row, 1, p_sheet, ret_ExcelSingleRecord.[STATUS]);
+	ret_ExcelSingleRecord.[NUM_2] := getNum(p_row, 2, p_sheet, ret_ExcelSingleRecord.[STATUS]);
+	ret_ExcelSingleRecord.[NUM_2] := getNum(p_row, 3, p_sheet, ret_ExcelSingleRecord.[STATUS]);
+	ret_ExcelSingleRecord.[DATE_1] := getDate(p_row, 4, p_sheet, ret_ExcelSingleRecord.[STATUS]);
+	ret_ExcelSingleRecord.[DATE_1] := getDate(p_row, 5, p_sheet, ret_ExcelSingleRecord.[STATUS]);
+	ret_ExcelSingleRecord.[BOOL] := getBool(p_row, 6, p_sheet, ret_ExcelSingleRecord.[STATUS]);
+
+	return ret_ExcelSingleRecord;
+end;
+
+
+-- чтение файла, проверка соответствию формата строк
+function readAndCheckStr(p_ExcelRecords out t_ExcelRecords) return boolean is
+	vSheet				integer := 1;
+	vRow				integer := 2;	-- в первой строке заголовок, чтение производится со второй строки
+	vRes				varchar2(32000); -- результат обработки файла
+	vTempRes			t_status;
+	vTempStr			varchar2(32000);
+begin
+	-- конец файла - пустое значение ячейки в первом столбце
+	-- инициализация
+	vTempStr := getStr(vRow, 1, vSheet, vTempRes);
+	
+	-- 1. парсинг реестра с записью результатов обработки в t_status
+	while vTempStr is not null loop
+		-- заголовок не обрабатывается
+		p_ExcelRecords(vRow - 1) := readAndCheckSingleStr(vRow, vSheet);
+		
+		vRow := vRow + 1;
+		vTempStr := getStr(vRow, 1, vSheet, vTempRes);
+	end loop;
+	
+	-- 2.1 анализ распарсенного файла и вывод сообщений пользователю в pipe
+	for i in 1..p_ExcelRecords.count loop
+		if p_ExcelRecords(i).[STATUS].[CODE] is not null then
+			vRes := vRes || p_ExcelRecords(i).[STATUS].[CODE];
+			debug_pipe(rtrim(p_ExcelRecords(i).[STATUS].[TEXT], chr(10)), 0);
+		end if;
+	end loop;
+	
+	-- 2.1. принятие решение по результатам анализа
+	-- "1" - критическая ошибка, при которой обработка реестра прерывается (описание кодов ошибок см. в t_status)
+	debug_pipe('[readAndCheckStr]. Легенда: 1 - ошибка (обработка файла прерывается);', 9);
+	debug_pipe('[readAndCheckStr].          2 - пропуск строки (файл обрабатывается, строка пропускается);', 9);
+	debug_pipe('[readAndCheckStr].          3 - предупреждение (файл и строка обрабатывается, созданный документ не проводится)', 9);
+	debug_pipe('[readAndCheckStr]. Перечень ошибок и предупреждений при обработке реестра: ' || vRes, 9);
+	if regexp_like(vRes, '1+') then
+		return false;
+	else
+		return true;
+	end if;
+end;
+
+
+-- обработка реестра: зачисление со счёта невыясненных сумм
+-- использование макросов в соответствие с п.2.2.9 "Правил оформления программного кода", не виноватая я
+function handleStr(p_ExcelRecords t_ExcelRecords) return boolean is
+begin
+	&sp (handleStr)
+	
+	for i in 1..p_ExcelRecords.count loop
+		if p_ExcelRecords(i).[STATUS].[CODE] is null or p_ExcelRecords(i).[STATUS].[CODE] = 3 then
+			debug_pipe('=============================================================================================================================',0);
+			debug_pipe('Вывод строки ' || to_char(i),0);
+			debug_pipe(p_ExcelRecords(i).[STR],0);
+			debug_pipe(p_ExcelRecords(i).[NUM_1],0);
+			debug_pipe(p_ExcelRecords(i).[NUM_2],0);
+			debug_pipe(p_ExcelRecords(i).[DATE_1],0);
+			debug_pipe(p_ExcelRecords(i).[DATE_2],0);
+			debug_pipe(p_ExcelRecords(i).[BOOL],0);
+
+/*
+			-- получение участника-получателя (для корректного проведения документов в R2 и филиалы)
+			vClPart := getClPart(p_ExcelRecords(i));
+			
+			vCurrentDoc := p_ExcelRecords(i).[UNDEF_DOCUM];
+			vNazn := 'По С/З от ' || to_char(sysdate, 'DD.MM.YY') || ' ' || vCurrentDoc.[NAZN];
+
+			-- документ квитовки (очищаем переменную), заполняем валюты и суммы, т.к. тот кто писал операцию "Зачисление со счета невыясненных сумм", вероятно, о регламенте разработки ничего не слышал
+			::[MAIN_DOCUM].[UNDEF_SUM_IN].[V_VAL_DT] := vCurrentDoc.[ACC_DT].[FINTOOL];
+			::[MAIN_DOCUM].[UNDEF_SUM_IN].[V_VAL_KT] := vCurrentDoc.[ACC_DT].[FINTOOL];
+			::[MAIN_DOCUM].[UNDEF_SUM_IN].[V_SUM_DT] := vCurrentDoc.[SUM];
+			::[MAIN_DOCUM].[UNDEF_SUM_IN].[V_SUM_KT] := vCurrentDoc.[SUM];
+			::[MAIN_DOCUM].[UNDEF_SUM_IN].[V_MAIN_DOC] := null;
+			
+			p_ExcelRecords(i).[UNDEF_DOCUM].[UNDEF_SUM_IN](
+															p_ExcelRecords(i).[KL_KT]			-- Реквизиты получателя
+															,p_ExcelRecords(i).[KL_KT].[1].[2]	-- Счет для зачисления
+															,vClPart							-- Участник-получатель
+															,vNazn								-- Назначение платежа
+															,true								-- Ответ в 16 очередь
+															,vSwift								-- Формировать документ SWIFT
+															);		
+			
+			if p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC] is not null then
+				-- для операции при выборке документа с учётом состояния индекс строится по состоянию и [DATE_DOC]
+				-- p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC]->(MAIN_DOCUM)[DATE_DOC] := p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC].[DOCUMENT_DATE];
+				if p_ExcelRecords(i).[STATUS].[CODE] is null then
+					vRightCnt := vRightCnt + 1;
+				else
+					vWrongCnt := vWrongCnt + 1;
+					debug_pipe('Создан, но не проведён документ id = ' || p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC]%id
+																  	   || ', №' || p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC].[DOCUMENT_NUM]
+																	   || ' на сумму ' || p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC]->(MAIN_DOCUM)[SUM]
+							   										   || ', получатель ' || p_ExcelRecords(i).[UNDEF_DOCUM].[QUIT_DOC]->(MAIN_DOCUM)[KL_KT].[2].[2],0);
+				end if;
+			else
+				pragma error('В результате выполнения операции "Зачисление со счета невыясненных сумм" не был корректно обработан документ с id = ' || p_ExcelRecords(i).[UNDEF_DOCUM]);
+			end if;
+*/
+		end if;
+	end loop;
+
+	return true;
+exception when others then
+	debug_pipe('Ошибка обработки реестра, откат создания документов зачисления со счёта невыясненных сумм: ' || sqlerrm, 0);
+	debug_pipe('Стек вызовов: ' || utils.call_stack, 9);
+	&rb (handleStr)
+	return false;
+end;
+
+
+-- чтение файла
+function initFile(p_FileVar FILE$LOAD) return boolean is
+	vOoxmlData	blob;
+begin
+	debug_pipe('-----------------------------------------------------------------------------------------------------------------------------', 0);
+	debug_pipe('Обработка регистра ' || p_FileVar.[SRC_PATH] || p_FileVar.[SRC_NAME] || ', астрономическая дата ' || to_char(sysdate,'DD.MM.YYYY HH24:MI:SS'), 0);
+	debug_pipe('-----------------------------------------------------------------------------------------------------------------------------', 0);
+	debug_pipe('[Инициализация]', 0);
+	
+	::[SHABLON_DOC].[LIB_OOXML].read_from_file(
+			  p_blob	==	vOoxmlData
+			, p_dir		==	p_FileVar.[DST_PATH]
+			, p_fname 	==	p_FileVar.[DST_NAME]
+			, p_delete 	==	false
+			);
+	
+	::[OOXML].[XL].Init_XLS;
+	
+	if ::[OOXML].[XL].open_file(vOoxmlData) then
+		debug_pipe('Файл успешно прочитан', 0);
+		return true;
+	else
+		debug_pipe('Ошибка чтения файла', 0);
+		return false;
+	end if;
+		
+-- TODO: нормально обработать ошибки открытия файла можно только отказавшись от использования ::[SHABLON_DOC].[LIB_OOXML].read_from_file, что не хочется
+-- exception when others then
+-- debug_pipe('[Инициализация] Ошибка чтения файла: ' || sqlerrm || ', обработка прервана', 0);
+end;
+
+
+-- базовый метод (парсинг, проверка, обработка)
+function handleFile return boolean
+is
+	vExcelRecords t_ExcelRecords;
+begin
+	-- 1. Проверки
+	-- 1.1. Проверка соответствия формату заголовка
+	debug_pipe('-----------------------------------------------------------------------------------------------------------------------------', 0);
+	debug_pipe('[Проверки]', 0);
+	
+	if checkHeaderFormat then
+		debug_pipe('Проверки заголовка пройдены', 0);			
+	else
+		debug_pipe('Во время проверок заголовка зафиксированы ошибки, обработка прервана', 0);
+		return false;
+	end if;
+	
+	-- 2. Чтение файла, проверка соответствию формата строк
+	if readAndCheckStr(vExcelRecords) then
+		debug_pipe('Проверки данных пройдены', 0);
+	else
+		debug_pipe('Во время проверок данных зафиксированы ошибки, обработка прервана', 0);
+		return false;
+	end if;
+		
+	-- 3. Обработка записей (если не трубуется, то можно отключить)
+	debug_pipe('-----------------------------------------------------------------------------------------------------------------------------', 0);
+	debug_pipe('[Зачисление средств со счёта невыясненных сумм]', 0);
+	if handleStr(vExcelRecords) then
+		debug_pipe('[+] Обработка реестра успешно завершена', 0);
+	else
+		debug_pipe('[-] Во время обработки реестра зафиксированы ошибки, обработка прервана', 0);
+		return false;
+	end if;
+	
+	return true;
+end;
+XXX_XLSX_PARSE (
+	@name('Файл') P_FILE in [FILE$LOAD]
+) is
+
+validate is
+begin
+	--debug_pipe('p_message = ' || p_message || '; p_info = ' || p_info, 10);	
+	if p_message = 'DEFAULT' then
+		-- путь к файлу и имя файла по умолчанию
+		P_FILE.[SRC_PATH] := ::[DEFVALS].[SLIB].RestoreStr( stdlib.userid,
+															&METHOD$Class,
+															&METHOD$SName,
+															'PATH_IN'
+														   );
+
+		P_FILE.[SRC_NAME] := ::[DEFVALS].[SLIB].RestoreStr( stdlib.userid,
+															&METHOD$Class,
+															&METHOD$SName,
+															'NAME_IN'
+														   );
+														
+		P_FILE.[SRC_TYPE] := false;
+		P_FILE.[SRC_MASK] := 'Microsoft Excel (*.xlsx)|*.xlsx|All Files (*.*)|*.*|';
+		P_FILE.[DST_TYPE] := true;	
+		P_FILE.[DST_PATH] := [SYSTEM_PARAMS]::[GET]('PATH',null);
+ 		
+	elsif p_message = 'VALIDATE' then
+		if p_info = 'P_FILE.SRC_MASK' then
+			P_FILE.[DST_NAME] := P_FILE.[SRC_NAME];
+		end if;
+  	end if;
+end;
+
+execute is
+/*
+TODO
+1. Если перед парсингом файла не требуется проверка заголовка, то отключить пункт "1." в handleFile; если требуется, внести исправление в текст, сверяемый в заголовке в initStandatdHeader
+2. Исправить атрибуты составного типа t_ExcelSingleRecord на требуемые
+3. Условие окончания файла - пустое значение ячейки в первом столбце, если используется иное, поправить метод readAndCheckStr
+4. Анализ ошибок и их вывод описан в методе readAndCheckStr, справочник ошибок в t_status - поправить при необходимости
+5. Для парсинга реализованы следующие методы, при необходимости необходимо написать свои:
+	getStr return varchar2(32000)
+	getNum return number (разделитель точка и запятая)
+	getDate return date (разделитель точка и слэш)
+	getBool return boolean
+	getUndefMainDocum return ref [MAIN_DOCUM] получение платёжного документа на счёте невыясненных сумм (с кэшированием)
+6. Для обработки прочитанных данных изменить метод handleStr, в примере реализован вывод данный в пайп.
+*/
+begin
+	if P_FILE.[SRC_PATH] is null then
+		pragma error('Не указан путь к файлу.');
+	end if;
+	
+	if P_FILE.[SRC_NAME] is null then
+		pragma error('Не указано имя файла.');
+	end if;
+						  	
+	-- чтение файла
+	if initFile(P_FILE) then
+		-- базовый метод (парсинг, проверка, обработка)
+		handleFile;
+	end if;
+	
+	-- сохраним путь к файлу и имя файла для следующего запуска
+	::[DEFVALS].[SLIB].SaveStr(stdlib.userid,
+								&METHOD$Class,
+								&METHOD$SName,
+								'PATH_IN',
+								P_FILE.[SRC_PATH]
+							  );
+
+	::[DEFVALS].[SLIB].SaveStr(stdlib.userid,
+								&METHOD$Class,
+								&METHOD$SName,
+								'NAME_IN',
+								P_FILE.[SRC_NAME]
+							  );
+end;
+end;
+end;
